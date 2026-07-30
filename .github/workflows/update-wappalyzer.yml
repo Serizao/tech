@@ -1,0 +1,115 @@
+name: Update Wappalyzer data
+
+on:
+  schedule:
+    # Tous les jours à 04:00 UTC
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Forcer la mise à jour même si la version est identique"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-wappalyzer
+  cancel-in-progress: false
+
+env:
+  AMO_API: https://addons.mozilla.org/api/v5/addons/addon/wappalyzer/
+  VERSION_FILE: wappalyzer-version.txt
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Récupérer la dernière version sur AMO
+        id: amo
+        run: |
+          set -euo pipefail
+          meta="$(curl -sSfL -H 'User-Agent: github-actions-wappalyzer-sync' "$AMO_API")"
+          version="$(echo "$meta" | jq -r '.current_version.version')"
+          url="$(echo "$meta" | jq -r '.current_version.file.url')"
+          if [ -z "$version" ] || [ "$version" = "null" ] || [ -z "$url" ] || [ "$url" = "null" ]; then
+            echo "::error::Impossible de lire la version/l'URL depuis l'API AMO"
+            exit 1
+          fi
+          current=""
+          [ -f "$VERSION_FILE" ] && current="$(tr -d '[:space:]' < "$VERSION_FILE")"
+          echo "Version amont : $version"
+          echo "Version locale : ${current:-<aucune>}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          if [ "$version" = "$current" ] && [ "${{ inputs.force }}" != "true" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Télécharger et dézipper le XPI
+        if: steps.amo.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          curl -sSfL -o /tmp/wappalyzer.xpi "${{ steps.amo.outputs.url }}"
+          mkdir -p /tmp/xpi
+          # Extraction complète : les motifs d'inclusion d'unzip ne descendent pas
+          # dans images/icons/converted/, on dézippe donc tout puis on trie nous-mêmes.
+          unzip -q -o /tmp/wappalyzer.xpi -d /tmp/xpi
+          # Garde-fou : on refuse d'écraser le repo avec une extraction vide/anormale
+          nb_tech=$(find /tmp/xpi/technologies -maxdepth 1 -type f -name '*.json' | wc -l)
+          nb_icons=$(find /tmp/xpi/images/icons -maxdepth 1 -type f | wc -l)
+          nb_conv=$(find /tmp/xpi/images/icons/converted -maxdepth 1 -type f | wc -l)
+          echo "Extrait : $nb_tech technologies, $nb_icons icônes, $nb_conv icônes converted"
+          if [ "$nb_tech" -lt 20 ] || [ "$nb_icons" -lt 1000 ] || [ "$nb_conv" -lt 1000 ]; then
+            echo "::error::Extraction suspecte (tech=$nb_tech, icons=$nb_icons, converted=$nb_conv), abandon"
+            exit 1
+          fi
+
+      - name: Synchroniser les technologies et les icônes
+        if: steps.amo.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          # technologies/*.json  ->  racine du repo (miroir : les fichiers disparus amont sont supprimés)
+          find . -maxdepth 1 -type f -regextype posix-extended -regex '\./([a-z]|_)\.json' -delete
+          find /tmp/xpi/technologies -maxdepth 1 -type f -name '*.json' -exec cp -p -t . {} +
+
+          # images/icons/*  ->  icons/  et  images/icons/converted/*  ->  icons/converted/
+          rm -rf icons
+          mkdir -p icons/converted
+          find /tmp/xpi/images/icons -maxdepth 1 -type f -exec cp -p -t icons/ {} +
+          find /tmp/xpi/images/icons/converted -maxdepth 1 -type f -exec cp -p -t icons/converted/ {} +
+
+          echo "${{ steps.amo.outputs.version }}" > "$VERSION_FILE"
+
+      - name: Commit & push
+        if: steps.amo.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Aucun changement à committer (version ${{ steps.amo.outputs.version }})."
+            exit 0
+          fi
+          git commit -m "Update Wappalyzer data to v${{ steps.amo.outputs.version }}"
+          git push
+
+      - name: Résumé
+        run: |
+          {
+            echo "### Wappalyzer sync"
+            echo ""
+            echo "- Version amont : \`${{ steps.amo.outputs.version }}\`"
+            if [ "${{ steps.amo.outputs.skip }}" = "true" ]; then
+              echo "- Statut : déjà à jour, rien à faire"
+            else
+              echo "- Statut : données synchronisées"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
